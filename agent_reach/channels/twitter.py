@@ -28,7 +28,7 @@ class TwitterChannel(Channel):
 
         for backend in self.ordered_backends(config):
             if backend == "twitter-cli":
-                result = self._check_twitter_cli()
+                result = self._check_twitter_cli(config)
             elif backend == "OpenCLI":
                 result = self._check_opencli()
             elif backend == "bird CLI (legacy)":
@@ -56,20 +56,65 @@ class TwitterChannel(Channel):
             "  uv tool install twitter-cli"
         )
 
-    def _check_twitter_cli(self):
+    def _check_twitter_cli(self, config=None):
         """探测 twitter-cli。返回 None 表示未安装，否则返回 (status, message)。
 
-        `twitter status` 才是健康信号：已登录时输出 "ok: true"，
-        未登录时以非零退出码输出 "not_authenticated"——工具本身是活的，
-        所以 probe 的 error 状态也要看 output 内容再分类。
+        为避免触发系统 Keychain 弹窗：
+        1. 优先使用不敏感的 `twitter --version` 探测其是否存在。
+        2. 若存在，检查环境变量或系统配置中是否已提供凭证。
+           若已提供，安全调用 `twitter status` 检查可用性；
+           若无凭证，必定未认证，直接返回 warn，避免运行 status 触发降级读取 Chrome 导致弹窗。
         """
-        probe = probe_command(
-            "twitter", ["status"], timeout=15, retries=1, package="twitter-cli"
+        import os
+
+        # 1. 快速安全地探测是否存在
+        probe_exist = probe_command(
+            "twitter", ["--version"], timeout=10, retries=1, package="twitter-cli"
         )
-        if probe.status == "missing":
+        if probe_exist.status == "missing":
             return None
-        if probe.status == "broken":
-            return "error", "twitter-cli 命令存在但无法执行。\n" + probe.hint
+        if probe_exist.status == "broken":
+            return "error", "twitter-cli 命令存在但无法执行。\n" + probe_exist.hint
+        if probe_exist.status == "timeout":
+            return "error", "twitter-cli 探测超时。\n" + probe_exist.hint
+
+        # 2. 判断凭证是否就绪以防弹窗
+        has_env = os.environ.get("TWITTER_AUTH_TOKEN") and os.environ.get("TWITTER_CT0")
+        has_config = False
+        if config:
+            has_config = config.get("twitter_auth_token") and config.get("twitter_ct0")
+
+        if not (has_env or has_config):
+            # 无凭证，不调用可能导致自动解密读取的 `twitter status`，免除弹窗
+            return "warn", (
+                "twitter-cli 已安装但未认证。设置方式：\n"
+                "  export TWITTER_AUTH_TOKEN=\"xxx\"\n"
+                "  export TWITTER_CT0=\"yyy\"\n"
+                "或确保已在浏览器中登录 x.com 并配置好 OpenCLI 绕过弹窗"
+            )
+
+        # 3. 凭证存在，安全校验状态
+        # 若当前进程环境变量中没有凭证但配置中有，则临时注入环境变量中，以防子进程降级读取本地 Chrome
+        old_env_token = os.environ.get("TWITTER_AUTH_TOKEN")
+        old_env_ct0 = os.environ.get("TWITTER_CT0")
+        if config and not (old_env_token and old_env_ct0):
+            os.environ["TWITTER_AUTH_TOKEN"] = config.get("twitter_auth_token") or ""
+            os.environ["TWITTER_CT0"] = config.get("twitter_ct0") or ""
+
+        try:
+            probe = probe_command(
+                "twitter", ["status"], timeout=15, retries=1, package="twitter-cli"
+            )
+        finally:
+            if old_env_token is None:
+                os.environ.pop("TWITTER_AUTH_TOKEN", None)
+            else:
+                os.environ["TWITTER_AUTH_TOKEN"] = old_env_token
+            if old_env_ct0 is None:
+                os.environ.pop("TWITTER_CT0", None)
+            else:
+                os.environ["TWITTER_CT0"] = old_env_ct0
+
         if probe.status == "timeout":
             return "error", "twitter-cli 健康检查超时（已重试 1 次）。\n" + probe.hint
 

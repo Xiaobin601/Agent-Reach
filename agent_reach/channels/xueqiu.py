@@ -74,32 +74,12 @@ def _load_cookies_from_config() -> bool:
 def _load_cookies_from_browser() -> bool:
     """Try to silently load Xueqiu cookies from the local Chrome browser.
 
-    Only succeeds when browser_cookie3 is installed AND the user is logged in
-    (xq_a_token present).  Failures are silently ignored so that agents without
-    a local browser keep working.
+    为了彻底避免运行 doctor 或公共 API 时隐式触发 macOS Keychain 弹窗：
+    此处不再进行隐式的 Chrome 钥匙串读取。
+    用户如果需要导入 Chrome 的雪球 Cookie，应显式运行：
+      agent-reach configure --from-browser chrome
     """
-    try:
-        try:
-            import rookiepy
-            cookies = rookiepy.chrome([".xueqiu.com"])
-            if not any(c.get("name") == "xq_a_token" for c in cookies):
-                return False
-            for c in cookies:
-                name = c.get("name")
-                value = c.get("value")
-                if name and value is not None:
-                    _inject_cookie_string(f"{name}={value}")
-            return True
-        except ImportError:
-            import browser_cookie3
-            cookies = list(browser_cookie3.chrome(domain_name=".xueqiu.com"))
-            if not any(c.name == "xq_a_token" for c in cookies):
-                return False
-            for c in cookies:
-                _cookie_jar.set_cookie(c)
-            return True
-    except Exception:
-        return False
+    return False
 
 
 def _ensure_cookies() -> None:

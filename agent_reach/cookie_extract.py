@@ -39,10 +39,228 @@ PLATFORM_SPECS = [
 ]
 
 
+def _extract_via_opencli() -> dict:
+    """尝试通过 OpenCLI 守护进程获取各大平台的 Cookies 列表。
+
+    返回的结构与 extract_all 降级后的 raw 提取结构一致，
+    例如：
+    {
+        "twitter": {"auth_token": "xxx", "ct0": "yyy"},
+        "xhs": {"cookie_string": "a=1; b=2; ..."},
+        ...
+    }
+    """
+    import urllib.request
+    import json
+    import uuid
+
+    url = "http://localhost:19825/command"
+    headers = {
+        "X-OpenCLI": "1",
+        "Content-Type": "application/json"
+    }
+
+    # 1. 先检测 opencli 守护进程是否连接且 Extension 在线
+    try:
+        req = urllib.request.Request("http://localhost:19825/status", method="GET")
+        req.add_header("X-OpenCLI", "1")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            status_data = json.loads(resp.read().decode("utf-8"))
+            if not (status_data.get("ok") and status_data.get("extensionConnected")):
+                return {}
+    except Exception:
+        return {}
+
+    # 2. 依次提取
+    results = {}
+
+    # 提取映射 (platform_key, domain_query, needed_cookies_list)
+    targets = [
+        ("twitter", ".x.com", ["auth_token", "ct0"]),
+        ("xhs", "xiaohongshu.com", None),
+        ("bilibili", ".bilibili.com", ["SESSDATA", "bili_jct"]),
+        ("xueqiu", "xueqiu.com", None),
+    ]
+
+    for platform_key, domain, needed_cookies in targets:
+        body = {
+            "id": str(uuid.uuid4()),
+            "action": "cookies",
+            "session": "agent-reach-sync",
+            "domain": domain
+        }
+        try:
+            post_data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(url, data=post_data, method="POST")
+            req.add_header("X-OpenCLI", "1")
+            req.add_header("Content-Type", "application/json")
+
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                if not resp_data.get("ok"):
+                    continue
+
+                raw_cookies = resp_data.get("data", [])
+
+                # 适配 extract_all 原始逻辑
+                class _Cookie:
+                    def __init__(self, name, value, domain_val):
+                        self.name = name
+                        self.value = value
+                        self.domain = domain_val
+
+                cookie_jar = [_Cookie(c.get("name", ""), c.get("value", ""), c.get("domain", "")) for c in raw_cookies]
+
+                platform_cookies = {}
+                all_cookies_for_domain = []
+
+                spec_domains = [domain] if not domain.startswith(".") else [domain, domain[1:]]
+                if platform_key == "twitter":
+                    spec_domains = [".x.com", ".twitter.com"]
+
+                for cookie in cookie_jar:
+                    domain_match = any(
+                        cookie.domain.endswith(d) or cookie.domain == d.lstrip(".")
+                        for d in spec_domains
+                    )
+                    if not domain_match:
+                        continue
+
+                    all_cookies_for_domain.append(cookie)
+                    if needed_cookies is not None:
+                        if cookie.name in needed_cookies:
+                            platform_cookies[cookie.name] = cookie.value
+
+                if needed_cookies is None:
+                    if all_cookies_for_domain:
+                        cookie_str = "; ".join(
+                            f"{c.name}={c.value}" for c in all_cookies_for_domain
+                        )
+                        results[platform_key] = {"cookie_string": cookie_str}
+                else:
+                    if platform_cookies:
+                        results[platform_key] = platform_cookies
+        except Exception:
+            continue
+
+    return results
+
+
+def _extract_via_browser_tools() -> dict:
+    """尝试通过本地的 browser-tools CDP 连接获取 Cookies。
+
+    返回的结构与 extract_all 降级后的 raw 提取结构一致。
+    """
+    import subprocess
+    import shutil
+    import os
+
+    # 1. 快速检查 node 是否存在
+    if not shutil.which("node"):
+        return {}
+
+    tools_dir = "/Users/xiaobin/ai-study/badlogic/pi-skills/browser-tools"
+    script_path = os.path.join(tools_dir, "browser-cookies.js")
+    if not os.path.exists(script_path):
+        return {}
+
+    try:
+        # 执行脚本，抓取 stdout
+        r = subprocess.run(
+            ["node", script_path],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8
+        )
+        if r.returncode != 0:
+            return {}
+
+        # 解析控制台输出
+        lines = r.stdout.splitlines()
+        raw_cookies = []
+        current = {}
+
+        for line in lines:
+            line_strip = line.strip()
+            if not line_strip:
+                if current and "name" in current:
+                    raw_cookies.append(current)
+                    current = {}
+                continue
+
+            if line.startswith("  "):
+                # 这是子属性，例如 "  domain: xxx"
+                if ":" in line_strip:
+                    k, _, v = line_strip.partition(":")
+                    current[k.strip()] = v.strip()
+            else:
+                # 这是主名，例如 "name: value"
+                if ":" in line_strip:
+                    k, _, v = line_strip.partition(":")
+                    current["name"] = k.strip()
+                    current["value"] = v.strip()
+
+        if current and "name" in current:
+            raw_cookies.append(current)
+
+        # 转换为适配结构
+        class _Cookie:
+            def __init__(self, name, value, domain_val):
+                self.name = name
+                self.value = value
+                self.domain = domain_val
+
+        cookie_jar = [_Cookie(c.get("name", ""), c.get("value", ""), c.get("domain", "")) for c in raw_cookies]
+
+        results = {}
+        targets = [
+            ("twitter", ".x.com", ["auth_token", "ct0"]),
+            ("xhs", "xiaohongshu.com", None),
+            ("bilibili", ".bilibili.com", ["SESSDATA", "bili_jct"]),
+            ("xueqiu", "xueqiu.com", None),
+        ]
+
+        for platform_key, domain, needed_cookies in targets:
+            platform_cookies = {}
+            all_cookies_for_domain = []
+
+            spec_domains = [domain] if not domain.startswith(".") else [domain, domain[1:]]
+            if platform_key == "twitter":
+                spec_domains = [".x.com", ".twitter.com"]
+
+            for cookie in cookie_jar:
+                domain_match = any(
+                    cookie.domain.endswith(d) or cookie.domain == d.lstrip(".")
+                    for d in spec_domains
+                )
+                if not domain_match:
+                    continue
+
+                all_cookies_for_domain.append(cookie)
+                if needed_cookies is not None:
+                    if cookie.name in needed_cookies:
+                        platform_cookies[cookie.name] = cookie.value
+
+            if needed_cookies is None:
+                if all_cookies_for_domain:
+                    cookie_str = "; ".join(
+                        f"{c.name}={c.value}" for c in all_cookies_for_domain
+                    )
+                    results[platform_key] = {"cookie_string": cookie_str}
+            else:
+                if platform_cookies:
+                    results[platform_key] = platform_cookies
+
+        return results
+    except Exception:
+        return {}
+
+
 def extract_all(browser: str = "chrome") -> Dict[str, dict]:
     """
     Extract cookies for all supported platforms from the specified browser.
-    
+
     Returns:
         {
             "twitter": {"auth_token": "xxx", "ct0": "yyy"},
@@ -50,6 +268,18 @@ def extract_all(browser: str = "chrome") -> Dict[str, dict]:
             "bilibili": {"SESSDATA": "xxx", "bili_jct": "yyy"},
         }
     """
+    # 优先使用 chrome 专用免弹窗方式
+    if browser.lower() == "chrome":
+        # 1. 优先尝试通过 OpenCLI 守护进程获取，以 100% 避免 Keychain 弹窗
+        opencli_cookies = _extract_via_opencli()
+        if opencli_cookies:
+            return opencli_cookies
+
+        # 2. 如果无 OpenCLI，尝试通过 browser-tools 免弹窗获取
+        bt_cookies = _extract_via_browser_tools()
+        if bt_cookies:
+            return bt_cookies
+
     # Try rookiepy first (Rust-based, more stable), fallback to browser_cookie3
     use_rookiepy = False
     try:
